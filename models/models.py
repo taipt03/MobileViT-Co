@@ -179,7 +179,7 @@ class MobileViTCo(nn.Module):
         )
         
         # MobileViT block 1
-        self.mvit1 = SimplifiedMobileViTBlock(
+        self.mvit1 = ColorViTBlock(
             dim=transformer_dims[0],
             depth=depths[0],
             channel=channels[2],
@@ -195,7 +195,7 @@ class MobileViTCo(nn.Module):
             expand_ratio=6
         )
         # MobileViT block 2
-        self.mvit2 = SimplifiedMobileViTBlock(
+        self.mvit2 = ColorViTBlock(
             dim=transformer_dims[1],
             depth=depths[1],
             channel=channels[3],
@@ -212,7 +212,7 @@ class MobileViTCo(nn.Module):
         )
         
         # MobileViT block 3
-        self.mvit3 = SimplifiedMobileViTBlock(
+        self.mvit3 = ColorViTBlock(
             dim=transformer_dims[2],
             depth=depths[2],
             channel=channels[4],
