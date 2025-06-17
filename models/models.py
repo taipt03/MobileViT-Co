@@ -140,7 +140,7 @@ class MobileNetV2Block(nn.Module):
             return x + result
         return result
 
-class ColorMobileViTv3(nn.Module):
+class MobileViTCo(nn.Module):
     def __init__(self, image_size=128, num_classes=4, variant='XS'):
         super().__init__()
         
