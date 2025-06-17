@@ -6,7 +6,7 @@ import os
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
-from utils import plot_training_curves
+from utils.utils import plot_training_curves
 
 def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001,  
                          use_mixup=True, label_smoothing=0.1, warmup_epochs=5, 
