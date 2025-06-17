@@ -17,6 +17,7 @@ class ColorAwareConv(nn.Module):
         out = self.bn(out)
         out = self.act(out)
         
+        # Color branch that matches output dimensions
         color_stats = self.color_pool(x)
         color_stats = self.color_conv(color_stats)
         color_features = F.adaptive_avg_pool2d(color_stats, 1)
@@ -24,7 +25,7 @@ class ColorAwareConv(nn.Module):
         
         return out + 0.2 * color_features
 
-class MobileViTCoBlock(nn.Module):
+class ColorViTBlock(nn.Module):
     def __init__(self, dim, depth, channel, kernel_size, patch_size, mlp_dim):
         super().__init__()
         self.ph, self.pw = patch_size
@@ -37,11 +38,10 @@ class MobileViTCoBlock(nn.Module):
         )
         
         actual_depth = max(1, depth // 2)
-
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=dim,
-                nhead=n_head, 
+                nhead=min(4, dim // 16),  
                 dim_feedforward=mlp_dim,
                 dropout=0.1,
                 activation='gelu',
@@ -59,12 +59,10 @@ class MobileViTCoBlock(nn.Module):
     def forward(self, x):
         local_rep = self.local_rep(x)
         
-        #reshape for transformer
         y = local_rep.permute(0, 2, 3, 1)
         y = y.reshape(y.shape[0], -1, y.shape[-1])
         y = self.transformer(y)
         
-        #reshape back to spatial dimensions
         y = y.reshape(local_rep.shape[0], local_rep.shape[2], local_rep.shape[3], -1)
         y = y.permute(0, 3, 1, 2)
         
@@ -99,52 +97,89 @@ class ColorHistogramLayer(nn.Module):
         
         for i in range(self.bins):
             mask = (x >= bin_edges[i]) & (x < bin_edges[i + 1])
-            if i == self.bins - 1:  
+            if i == self.bins - 1:  # upper edge for the last bin
                 mask = mask | (x == bin_edges[i + 1])
-            hist[:, i] = mask.float().mean(dim=1) 
+            hist[:, i] = mask.float().mean(dim=1)
         
         return hist
 
-class MobileViTCo(nn.Module):
-    def __init__(self, image_size=128, num_classes=4, variant='XXS'):
+class MobileNetV2Block(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, expand_ratio=6):
+        super().__init__()
+        self.stride = stride
+        self.use_residual = stride == 1 and in_channels == out_channels
+        
+        hidden_dim = in_channels * expand_ratio
+        
+        layers = []
+        
+        if expand_ratio != 1:
+            layers.extend([
+                nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True)
+            ])
+        
+        layers.extend([
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=stride, 
+                     padding=1, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True)
+        ])
+        
+        layers.extend([
+            nn.Conv2d(hidden_dim, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        ])
+        
+        self.conv = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        result = self.conv(x)
+        if self.use_residual:
+            return x + result
+        return result
+
+class ColorMobileViTv3(nn.Module):
+    def __init__(self, image_size=128, num_classes=4, variant='XS'):
         super().__init__()
         
-        if variant == 'XXS':
+        if variant == 'XS':
             channels = [16, 24, 48, 64, 80]
             transformer_dims = [64, 80, 96]
             depths = [2, 2, 2]
             mlp_dims = [128, 160, 192]
-        elif variant == 'XS':
+        else: # 'S' variant
             channels = [16, 32, 48, 80, 160]
             transformer_dims = [96, 120, 160]
             depths = [2, 4, 4]
             mlp_dims = [192, 240, 320]
-        else: 
-            raise ValueError(f"Variant {variant} not supported. Choose from 'XXS' or 'XS'")
+
         
-        
+        # Initial convolution
         self.conv1 = nn.Sequential(
             nn.Conv2d(3, channels[0], kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(channels[0]),
-            nn.SiLU()
+            nn.ReLU6(inplace=True)
         )
         
-        #mobilenet blocks
-        
-        self.mv2_1 = nn.Sequential(
-            nn.Conv2d(channels[0], channels[1], kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(channels[1]),
-            nn.SiLU()
+        # MobileNetV2 blocks
+        self.mv2_1 = MobileNetV2Block(
+            in_channels=channels[0], 
+            out_channels=channels[1], 
+            stride=2, 
+            expand_ratio=1  
         )
         
-        self.mv2_2 = nn.Sequential(
-            nn.Conv2d(channels[1], channels[2], kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(channels[2]),
-            nn.SiLU()
+        self.mv2_2 = MobileNetV2Block(
+            in_channels=channels[1], 
+            out_channels=channels[2], 
+            stride=2, 
+            expand_ratio=6
         )
         
-        # MobileViTCo blocks
-        self.mvit1 = MobileViTCoBlock(
+        # MobileViT block 1
+        self.mvit1 = SimplifiedMobileViTBlock(
             dim=transformer_dims[0],
             depth=depths[0],
             channel=channels[2],
@@ -153,13 +188,14 @@ class MobileViTCo(nn.Module):
             mlp_dim=mlp_dims[0]
         )
         
-        self.mv2_3 = nn.Sequential(
-            nn.Conv2d(channels[2], channels[3], kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(channels[3]),
-            nn.SiLU()
+        self.mv2_3 = MobileNetV2Block(
+            in_channels=channels[2], 
+            out_channels=channels[3], 
+            stride=2, 
+            expand_ratio=6
         )
-
-        self.mvit2 = MobileViTCoBlock(
+        # MobileViT block 2
+        self.mvit2 = SimplifiedMobileViTBlock(
             dim=transformer_dims[1],
             depth=depths[1],
             channel=channels[3],
@@ -168,12 +204,14 @@ class MobileViTCo(nn.Module):
             mlp_dim=mlp_dims[1]
         )
         
-        self.mv2_4 = nn.Sequential(
-            nn.Conv2d(channels[3], channels[4], kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(channels[4]),
-            nn.SiLU()
+        self.mv2_4 = MobileNetV2Block(
+            in_channels=channels[3], 
+            out_channels=channels[4], 
+            stride=2, 
+            expand_ratio=6
         )
         
+        # MobileViT block 3
         self.mvit3 = SimplifiedMobileViTBlock(
             dim=transformer_dims[2],
             depth=depths[2],
@@ -191,18 +229,20 @@ class MobileViTCo(nn.Module):
     def forward(self, x):
         color_hist = self.color_histogram(x)
         
-        x = self.conv1(x)
-        x = self.mv2_1(x)
-        x = self.mv2_2(x)
-        x = self.mvit1(x)
-        x = self.mv2_3(x)
-        x = self.mvit2(x)
-        x = self.mv2_4(x)
-        x = self.mvit3(x)
+        x = self.conv1(x)           # 128x128 -> 64x64
+        x = self.mv2_1(x)           # 64x64 -> 32x32
+        x = self.mv2_2(x)           # 32x32 -> 16x16
+        x = self.mvit1(x)           # 16x16 (with attention)
+        x = self.mv2_3(x)           # 16x16 -> 8x8
+        x = self.mvit2(x)           # 8x8 (with attention)
+        x = self.mv2_4(x)           # 8x8 -> 4x4
+        x = self.mvit3(x)           # 4x4 (with attention)
         
-        x = F.adaptive_avg_pool2d(x, 1)
+        # Global average pooling
+        x = F.adaptive_avg_pool2d(x, 1)  # 4x4 -> 1x1
         x = torch.flatten(x, 1)
         
+        # Combine features
         combined = torch.cat([x, color_hist], dim=1)
         combined = self.dropout(combined)
         return self.classifier(combined)
